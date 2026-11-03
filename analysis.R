@@ -5,7 +5,8 @@
 # script; only machine-specific paths and internal notes differ.
 # Input data files are not distributed (see README): the release holds
 # the pipeline and the manuscript's published derived tables only.
-# Unzip derived_tables.zip to output/tables/ to compare a rerun.
+# Unzip derived_tables.zip in the repository root (files land in
+# output/tables/) to compare a rerun.
 # License: MIT (full text in README.md).
 # Run from the repository root: Rscript analysis.R
 # ==========================================================================
@@ -805,6 +806,36 @@ validation <- tibble(
                wq(PAR$scene_min + alpha * acc$t_cath, w, .5)))
 write_csv(validation, file.path(tabs, "validation_moments.csv"))
 print(validation)
+
+# Call-weighted calibration check. SRCA's 7:46 travel and 45.43% KPI are per
+# call, while the weights above are residents. SRCA reports 2025 missions
+# only by region, so each cell's weight is scaled by its region's missions
+# per resident and alpha and delta are refitted. Within a region, residents
+# still stand in for calls (eMethods 2).
+calib_fit <- function(wt) {
+  a <- PAR$obs$travel_scene_min / weighted.mean(acc$t_legA, wt, na.rm = TRUE)
+  d <- uniroot(
+    function(d) cov_pct(FIXED_PRE + d + a * acc$t_legA, wt,
+                        PAR$std$response) - PAR$obs$resp8_share,
+    c(0, 30))$root
+  c(alpha = a,
+    base_le8_pct = cov_pct(FIXED_PRE + a * acc$t_legA, wt, PAR$std$response),
+    delta_min = d)
+}
+mpr <- with(reg_tab, setNames(missions_2025 / pop, region_en))
+w_call <- w * unname(mpr[acc$region_en])
+stopifnot(!anyNA(w_call))
+cw <- rbind(calib_fit(w), calib_fit(w_call))
+calib_wt <- tibble(
+  weighting    = c("Residents (main analysis)",
+                   "2025 SRCA missions by region"),
+  alpha        = cw[, "alpha"],
+  base_le8_pct = cw[, "base_le8_pct"],
+  delta_min    = cw[, "delta_min"])
+stopifnot(abs(calib_wt$alpha[1] - alpha) < 1e-9,
+          abs(calib_wt$delta_min[1] - delta_op) < 1e-6)
+write_csv(calib_wt, file.path(tabs, "tableS_calibration_weighting.csv"))
+print(calib_wt)
 
 # ---- 8. Bypass analysis (mothership vs nearest-ED penalty) ---------------
 # Extra transport minutes to reach definitive care (cath / stroke centre)

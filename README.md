@@ -7,7 +7,7 @@ Replication package for the manuscript (Batobara A, Alfaraidhy M, Lim C; under r
 | File | What it is |
 |---|---|
 | `analysis.R` | The single analysis pipeline (Sections 0-12: supply, demand, routing, calibration, outcomes, KPI decomposition, bypass, inequality, spatial clustering, sensitivity analyses, figures, capability upgrades, rank stability, and new-station siting). |
-| `derived_tables.zip` | The manuscript's 16 derived tables exactly as produced by the deposited run; every number in the paper traces to these CSVs (unzip to `output/tables/` to compare against a rerun). |
+| `derived_tables.zip` | The manuscript's 17 derived tables exactly as produced by the deposited run; every number in the paper traces to these CSVs (unzip in the repository root; the files land in `output/tables/`, ready to compare against a rerun). |
 | `README.md` | This file, including the license. |
 
 ## Data files
@@ -57,6 +57,7 @@ Tables 1-2 are assembled from `table1_national.csv`, `tableS_urban_rural.csv`, a
 | eTable 12 | `tableS_upgrade_sites_stroke.csv` |
 | eTable 13 | `tableS_station_sites.csv` (each site labeled with the nearest primary health care center's place name) |
 | eMethods 3 (rank stability) | `tableS_upgrade_stability.csv` |
+| Methods, Calibration (α and δ refitted with regions weighted by 2025 SRCA missions) | `tableS_calibration_weighting.csv` |
 
 ## Notes
 
