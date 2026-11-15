@@ -1,12 +1,12 @@
 # Access to Trauma, Myocardial Infarction, and Stroke Care Through Saudi Arabia's Ambulance Network: A Modeling Study
 
-Replication package for the manuscript (Batobara A, Alfaraidhy M, Lim C; under review). One reproducible R script models the full prehospital chain, call receipt to hospital door, for every populated square kilometer of Saudi Arabia, calibrated to published SRCA 2025 operational moments, and ranks capability upgrades across the health cluster (Health Holding Company) hospital network and new ambulance-station sites. Please cite the manuscript when using this code or the tables.
+Replication package for the manuscript (Batobara A, Alfaraidhy M, Damluji AA, Lim C; under review). One reproducible R script models the full prehospital chain, call receipt to hospital door, for every populated square kilometer of Saudi Arabia, calibrated to published SRCA 2025 operational moments, and ranks capability upgrades across the health cluster (Health Holding Company) hospital network and new ambulance-station sites. Please cite the manuscript when using this code or the tables.
 
 ## Contents (three files)
 
 | File | What it is |
 |---|---|
-| `analysis.R` | The single analysis pipeline (Sections 0-12: supply, demand, routing, calibration, outcomes, KPI decomposition, bypass, inequality, spatial clustering, sensitivity analyses, figures, capability upgrades, rank stability, and new-station siting). |
+| `analysis.R` | The single analysis pipeline (Sections 0-13: supply, demand, routing, calibration, outcomes, KPI decomposition, bypass, inequality, spatial clustering, sensitivity analyses, figures, capability upgrades with expected volume, rank stability, new-station siting, probabilistic sensitivity analysis, and rural-favoring station siting). |
 | `derived_tables.zip` | The manuscript's 17 derived tables exactly as produced by the deposited run; every number in the paper traces to these CSVs (unzip in the repository root; the files land in `output/tables/`, ready to compare against a rerun). |
 | `README.md` | This file, including the license. |
 
@@ -20,13 +20,14 @@ No input data ship with this release. The facility coordinate files (509 SRCA am
 |---|---|
 | `raw/gcc-states-latest.osm.pbf` | Geofabrik GCC extract, https://download.geofabrik.de/asia/gcc-states.html (~250 MB; OpenStreetMap contributors, ODbL) |
 | `raw/sau_ppp_2020_constrained.tif` | WorldPop 2020 constrained 100-m population, doi:10.5258/SOTON/WP00685 |
+| `raw/PopulationbydetailedAgebyRegionGovernorateNationalityandGenderARCSV.csv` | GASTAT Saudi Census 2022, population by single-year age, sex, nationality, and governorate (stats.gov.sa); STEMI and stroke denominator (residents aged 40 or older, by governorate) and age sensitivity rows |
 | `raw/PopulationbyNationalitybyRegionGovernorateCityandNationalityARCSV.csv` | GASTAT Saudi Census 2022, population by nationality/region/governorate/city (stats.gov.sa) |
 | `raw/governorate/Governorate.gpkg` | Governorate boundaries (150 units; official boundary release) |
 | `raw/Regions/Regions.shp` | The 13 administrative regions (official boundary release) |
 | `raw/srca_report_regional_2025.csv` | Transcribe from SRCA Annual Report 2025 Tables 22/2 (missions), 23/2 (transports), 28/2 (launch points): columns `region_en, missions_2025, transports_2025, launch_points_2025`; the script asserts the printed totals (1,416,037; 568,827; 520). |
 | `raw/SRCA Centers/srca_centers.csv` | One row per distinct station: `lat, lon` (WGS84). |
-| `raw/Cath Centers/cath_centers.csv` | One row per center: `lat, lon, moh_facility_id` (MoH facility ID from the cluster directories, blank if not MoH), `sector` (MoH, Private, University, Military, National Guard, Other government). |
-| `raw/Stroke Centers/stroke_centers.csv` | As for catheterization centers; an optional `reperfusion_capable` column (TRUE/FALSE) activates the Tier-2 stroke arm. |
+| `raw/Cath Centers/cath_centers.csv` | One row per center: `lat, lon, moh_facility_id` (MoH facility ID from the cluster directories, blank if not MoH), `sector` (MoH, Private, University, Military, National Guard, Other government), `srca_patients_2025` (STEMI-pathway patients SRCA delivered to the center in 2025, SRCA Annual Report Table 36/2; used for expected volume at upgraded sites). |
+| `raw/Stroke Centers/stroke_centers.csv` | As for catheterization centers (`srca_patients_2025` from Table 38/2); an optional `reperfusion_capable` column (TRUE/FALSE) activates the Tier-2 stroke arm. |
 | `raw/list_of_healthcare_providers.csv` | Cluster hospitals from the Health Holding Company directories: `facility_id, name_en, type` (2ry or 3ry), `scope, bed_capacity, lat, lon, governorate_en, region_en, region_ar, cluster_en`. Trauma destinations (SRCA's routine: the nearest cluster hospital with an emergency department) are 2ry rows with `General` or `Emergency` scope plus 3ry rows whose `scope` is `Medical City` or `Specialist`; single-specialty centres are excluded. |
 
 ## Running
@@ -52,10 +53,11 @@ Tables 1-2 are assembled from `table1_national.csv`, `tableS_urban_rural.csv`, a
 | eTable 7 | `tableS_inequality.csv` |
 | eTable 8 | `tableS_spatial_moran.csv` |
 | eTable 9 | `tableS_lisa_lowlow.csv` |
-| eTable 10 | `tableS_sensitivity.csv` |
-| eTable 11 | `tableS_upgrade_sites_stemi.csv` |
+| eTable 10 | `tableS_sensitivity.csv` (Panel A), `tableS_psa.csv` (Panel B, probabilistic sensitivity analysis) |
+| eTable 11 | `tableS_upgrade_sites_stemi.csv` (with catchment aged 40+ and expected SRCA patients per year) |
 | eTable 12 | `tableS_upgrade_sites_stroke.csv` |
 | eTable 13 | `tableS_station_sites.csv` (each site labeled with the nearest primary health care center's place name) |
+| eTable 14 | `tableS_station_siting_compare.csv` (Panel A), `tableS_station_sites_rural.csv` (Panel B, rural-favoring station siting) |
 | eMethods 3 (rank stability) | `tableS_upgrade_stability.csv` |
 | Methods, Calibration (α and δ refitted with regions weighted by 2025 SRCA missions) | `tableS_calibration_weighting.csv` |
 
@@ -64,11 +66,12 @@ Tables 1-2 are assembled from `table1_national.csv`, `tableS_urban_rural.csv`, a
 - The stroke Tier-2 (reperfusion-capable) arm activates automatically when a clinician-verified list is supplied (Section 1); the deposited run used Tier-1 receiving designation only, as reported.
 - Facility sector labels carry designation as published, not verified clinical capability.
 - Trauma destinations follow SRCA's routine, the nearest cluster hospital with an emergency department. Saudi Arabia has no trauma-centre designation; onward transfer between hospitals is not modeled.
-- The calibration factor is fitted to one observed moment (mean travel-to-scene, 7 min 46 s). The residual delay delta is then solved so the modeled 8-minute share equals the observed 45.43%; it is an unexplained residual (operational and model-related), not a measured delay. The reported mean response, the stroke- and STEMI-pathway responses, and the STEMI pathway's mean time to reach a cardiac hospital (37 minutes; compared with modeled medians) serve as consistency checks.
+- The calibration factor is fitted to one observed performance indicator (mean travel-to-scene, 7 min 46 s). The residual delay delta is then solved so the modeled 8-minute share equals the observed 45.43%; it is an unexplained residual (operational and model-related), not a measured delay. The reported mean response, the stroke- and STEMI-pathway responses, and the STEMI pathway's mean time to reach a cardiac hospital (37 minutes; compared with modeled medians) serve as consistency checks.
 - STEMI access is measured from first medical contact (ambulance arrival) to device, the ACC/AHA metric (90 minutes; 120 minutes as the fibrinolysis threshold): 15 minutes on scene (AHA benchmark; 2026 AHA/ASA stroke guideline and AHA EMS performance measures) + calibrated transport + 35 minutes door-to-device (median door-to-balloon time for ambulance patients taken directly to the catheterization laboratory; Meisel 2021, Savage 2023; `PAR$door_device_min`; 45 and 63 minutes in sensitivity rows). SRCA's 37-minute STEMI-pathway figure is the time to reach a cardiac hospital and is used only as a consistency check. Call-to-door times are also reported.
 - Road speeds come from OpenStreetMap `maxspeed` tags; dodgr fills untagged ways from tagged ways of the same class, so the deposited graph runs unpaved tracks at 40 km/h (the Saudi value in Weiss et al., Nat Med 2020, Supplementary Table 1). `PAR$track_speed` (30) is used only if the graph is rebuilt; the sensitivity row caps tracks at `PAR$track_sens` (30 km/h) on a copy of the graph and refits the calibration factor.
 - Origins and destinations snap only to the strongly connected core of each road component (`graph_core_vertices.rds`); `data/processed/reachability_check.csv` records that every facility and station receives routed residents or shares a campus with one that does.
 - Candidate sites for new stations are populated 1-km cells, treated as locations only.
+- Response and trauma results count all residents; STEMI and stroke results count residents aged 40 or older (the age from which the 2019 ACC/AHA primary prevention guideline estimates cardiovascular risk). The census gives age by governorate, so each cell takes its governorate's 40+ share (`cell_cv` in `cell_level_results.csv`); eTable 10 adds all-ages, 50+, and 65+ rows for STEMI and stroke.
 
 ## License
 

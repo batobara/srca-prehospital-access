@@ -11,20 +11,21 @@
 # Run from the repository root: Rscript analysis.R
 # ==========================================================================
 # ==========================================================================
-# Prehospital ambulance access to trauma, STEMI, and stroke care in
-# Saudi Arabia: a national two-leg spatial model of the SRCA network
+# Access to trauma, myocardial infarction (STEMI), and stroke care through
+# Saudi Arabia's ambulance network: a national model of the SRCA network
 #
 # Single-file analysis pipeline. Sections:
-#   0. Setup and parameters (incl. SRCA 2025 report observed moments)
+#   0. Setup and parameters (incl. SRCA 2025 report performance indicators)
 #   1. Supply: 509 SRCA ambulance centres; destination sets for trauma
-#      (MoH general/tertiary hospitals), STEMI (73 cath centres), stroke
+#      (233 cluster hospitals with an emergency department), STEMI (73 cath
+#      centres), stroke
 #      (71 SRCA-receiving hospitals; optional reperfusion-capable Tier 2)
 #   2. Governorates, regions, census population (demand)
 #   3. Gridded population (WorldPop scaled to GASTAT 2022 totals)
 #   4. Travel times (dodgr street-network routing, no external server)
 #      Leg A: nearest SRCA centre -> population cell   (station-to-scene)
 #      Leg B: population cell -> nearest facility      (scene-to-door)
-#   5. Calibration (demand-weighted, one moment)
+#   5. Calibration (demand-weighted, one performance indicator)
 #   6. Full-chain call-to-door times and standards compliance
 #   7. 8-minute response KPI: structural vs operational decomposition,
 #      incl. a KPI-matched residual-delay scenario (lower bound)
@@ -39,10 +40,12 @@
 #      capability-upgrade site rankings (STEMI cath, stroke receiving)
 #      across the Health Holding Company (MoH) general-hospital network;
 #      greedy new-station siting for the 8-minute response (structural
-#      lever, compared with cutting the per-call residual delta)
+#      lever, compared with cutting the per-call residual delta); expected
+#      SRCA volume at upgraded sites
+#  13. Probabilistic sensitivity analysis; rural-favoring station siting
 #
 # Model: call-to-door time for each 1-km populated cell =
-#   fixed pre-departure intervals (queue 0:48 + mobilization 0:27, SRCA
+#   fixed pre-departure intervals (call handling 0:48 + mobilization 0:27, SRCA
 #   2025 report, Table 17/2) + alpha * LegA + on-scene time (10/15/20 min
 #   scenarios) + alpha * LegB, where alpha is a single speed factor
 #   calibrated so the demand-weighted mean of alpha*LegA equals SRCA's
@@ -54,7 +57,9 @@
 # Open decisions are parameters, not code changes:
 #   PAR$trauma_set   -- "general" (default) | "all" | "beds100"
 #   PAR$scene_min    -- 15 (default) | 10 | 20
-#   Denominator      -- total residents primary; Saudi-only is a sensitivity
+#   Denominators     -- all residents for response and trauma; residents aged
+#                       40+ for STEMI and stroke (Section 3); Saudi-only and
+#                       other age cut-offs are sensitivities (Section 10)
 #   Stroke Tier 2    -- auto-runs iff a reperfusion list is supplied (see S1)
 #
 # Expensive steps cache to data/processed/ as .rds; delete a cache file to
@@ -113,9 +118,9 @@ PAR <- list(
                                 #   Weiss 2020, Nat Med, Suppl Table 1)
   track_sens  = 30,             # km/h: conservative track-speed sensitivity
 
-  # --- SRCA Annual Report 2025 observed moments (report page refs) ---
+  # --- SRCA Annual Report 2025 performance indicators (report page refs) ---
   obs = list(
-    queue_min        = 48 / 60,   # call queuing            (p72, Table 17/2)
+    queue_min        = 48 / 60,   # call handling (queuing) (p72, Table 17/2)
     mobilize_min     = 27 / 60,   # crew mobilization       (p72, Table 17/2)
     travel_scene_min = 7 + 46/60, # travel to scene, mean   (p72, Table 17/2)
     resp_mean_min    = 10 + 31/60,# overall response, mean  (p72, Table 18/2)
@@ -130,12 +135,14 @@ PAR <- list(
   # --- model scenarios and standards ---
   scene_min   = 15,             # on-scene minutes (primary; 10/20 sensitivity)
   # On scene 15 min = AHA benchmark for stroke and STEMI (2027 AHA EMS
-  # Performance Measures AHAEMS13.0/14.0; Jauch 2013 stroke guideline).
+  # Performance Measures AHAEMS13.0/14.0; 2026 AHA/ASA acute ischemic stroke
+  # guideline, Prabhakaran 2026).
   # Riyadh Province 2018 medians are 18-23 min (Moafa 2022), approximated by
   # the 20-min sensitivity row; nationally 59.2% of road-traffic scenes take
   # <= 15 min (Alslamah 2023), which supports 15 min for trauma.
-  # Door-to-device 35 min = median door-to-balloon after paramedic-activated
-  # ED bypass (Cheskes 2011); SRCA's pathway bypasses the ED (report p99).
+  # Door-to-device 35 min = median door-to-balloon time (34-35 min) for
+  # ambulance patients taken directly to the catheterization laboratory
+  # (Meisel 2021; Savage 2023); SRCA's pathway bypasses the ED (report p99).
   # 45 min and the STARS-2 national median door-to-balloon (63 min; mostly
   # ED arrivals, 8.5% by EMS) are sensitivity rows. SRCA's 37 min (Table
   # 35/2) is the time to REACH a cardiac hospital, not a hospital interval.
@@ -288,9 +295,29 @@ gov_region <- pop_city |>
   group_by(gov_key) |> slice_max(n, n = 1, with_ties = FALSE) |> ungroup() |>
   left_join(reg_names, by = "reg_key") |> select(gov_key, region_en)
 
+# Governorate age shares (2022 census by single-year age): STEMI and stroke
+# analyses count residents aged 40 or older (Section 3); 50+ and 65+ shares
+# feed the sensitivity rows (Section 10).
+pop_age <- read_csv(
+  file.path(raw, "PopulationbydetailedAgebyRegionGovernorateNationalityandGenderARCSV.csv"),
+  show_col_types = FALSE)
+names(pop_age) <- c("nationality", "age", "age5", "governorate", "region", "gender", "pop")
+age_share <- pop_age |>
+  mutate(gov_key = norm_ar(governorate),
+         age   = suppressWarnings(as.integer(gsub("\\D", "", age))),
+         saudi = nationality == "سعودي") |>
+  group_by(gov_key) |>
+  summarise(s40 = sum(pop[age >= 40]) / sum(pop),
+            s50 = sum(pop[age >= 50]) / sum(pop),
+            s65 = sum(pop[age >= 65]) / sum(pop),
+            s40_saudi = sum(pop[saudi & age >= 40]) / sum(pop[saudi]),
+            .groups = "drop")
+stopifnot(sum(pop_age$pop) == sum(pop_city$pop))
+
 gov_pop <- gov |>
   left_join(pop_gov,    by = "gov_key") |>
-  left_join(gov_region, by = "gov_key")
+  left_join(gov_region, by = "gov_key") |>
+  left_join(age_share,  by = "gov_key")
 
 unmatched <- gov_pop |> st_drop_geometry() |>
   filter(is.na(pop_total)) |> select(Gov_AR, Gov_EN, gov_key)
@@ -312,8 +339,10 @@ if (nrow(reg_missing) > 0) {
 # WorldPop 2020 constrained (100 m, settled areas only) aggregated to 1 km
 # supplies the within-governorate distribution; cells rescaled so each
 # governorate sums to its GASTAT 2022 census totals (total and Saudi).
-# Denominator: TOTAL residents primary -- SRCA responds universally
-# (opposite of the cluster-enrolment paper); Saudi-only is a sensitivity.
+# Denominators: TOTAL residents for response and trauma -- SRCA responds
+# universally (opposite of the cluster-enrolment paper); residents aged 40 or
+# older for STEMI and stroke (below). Saudi-only and other age cut-offs are
+# sensitivities (Section 10).
 
 wp_path <- file.path(raw, "sau_ppp_2020_constrained.tif")
 if (!file.exists(wp_path))
@@ -342,6 +371,25 @@ grid <- cache("grid_population", {
 message(sprintf("Population grid: %s cells | residents %.0f | Saudi %.0f",
                 format(nrow(grid), big.mark = ","),
                 sum(grid$cell_total), sum(grid$cell_saudi)))
+
+# Cardiovascular denominator (2026-11-14): STEMI and stroke count residents
+# aged 40 or older, the age from which guidelines estimate 10-year
+# cardiovascular risk (ACC/AHA 2019 primary prevention guideline; WHO 2019
+# risk charts, derived in ages 40-80). The census gives age by governorate,
+# not by cell, so each cell takes its governorate's share.
+age_g <- gov_pop |> st_drop_geometry() |>
+  select(Gov_EN, s40, s50, s65, s40_saudi)
+stopifnot(!anyDuplicated(age_g$Gov_EN))
+ix <- match(grid$Gov_EN, age_g$Gov_EN)
+grid <- grid |>
+  mutate(cell_cv       = cell_total * age_g$s40[ix],
+         cell_cv_saudi = cell_saudi * age_g$s40_saudi[ix],
+         cell_50       = cell_total * age_g$s50[ix],
+         cell_65       = cell_total * age_g$s65[ix])
+stopifnot(!anyNA(grid$cell_cv), !anyNA(grid$cell_cv_saudi),
+          !anyNA(grid$cell_50), !anyNA(grid$cell_65))
+message(sprintf("Residents aged 40+: %.0f (%.1f%% of residents)",
+                sum(grid$cell_cv), 100 * sum(grid$cell_cv) / sum(grid$cell_total)))
 
 # ---- 4. Travel times (dodgr street-network routing) ----------------------
 # One-time input: the Geofabrik Gulf extract at PAR$pbf_path
@@ -571,7 +619,7 @@ wq <- function(x, w, p) {
 cov_pct <- function(x, w, thr) sum(w[!is.na(x) & x <= thr]) / sum(w) * 100
 
 # ---- 5. Calibration ------------------------------------------------------
-# One moment fitted: alpha scales unadjusted car travel times so the
+# One performance indicator fitted: alpha scales unadjusted car travel times so the
 # DEMAND-weighted mean of alpha*LegA equals the observed mean travel-to-
 # scene (7:46). Demand weight = cell population (call volume proxy: SRCA
 # means are call-weighted and therefore urban-skewed; an unweighted mean
@@ -620,16 +668,20 @@ natl_row <- function(x, w, std, label) {
       paste0("le_", PAR$thresholds, "min"))))
 }
 
-w <- acc$cell_total
+w    <- acc$cell_total   # response and trauma: all residents
+w_cv <- acc$cell_cv      # STEMI and stroke: residents aged 40+
 natl <- bind_rows(
-  natl_row(acc$t_resp,        w, PAR$std$response,  "Response (call to scene)"),
-  natl_row(acc$t_door_trauma, w, PAR$std$trauma,    "Trauma: call to hospital door"),
-  natl_row(acc$t_fmc_device,  w, PAR$std$stemi_fmc, "STEMI: first medical contact to device"),
-  natl_row(acc$t_door_cath,   w, PAR$std$stemi_door,"STEMI: call to cath-centre door"),
-  natl_row(acc$t_door_strk1,  w, PAR$std$stroke,    "Stroke: call to receiving-hospital door (Tier 1)"),
-  if (has_t2) natl_row(acc$t_door_strk2, w, PAR$std$stroke,
+  natl_row(acc$t_resp,        w,    PAR$std$response,  "Response (call to scene)"),
+  natl_row(acc$t_door_trauma, w,    PAR$std$trauma,    "Trauma: call to hospital door"),
+  natl_row(acc$t_fmc_device,  w_cv, PAR$std$stemi_fmc, "STEMI: first medical contact to device"),
+  natl_row(acc$t_door_cath,   w_cv, PAR$std$stemi_door,"STEMI: call to cath-centre door"),
+  natl_row(acc$t_door_strk1,  w_cv, PAR$std$stroke,    "Stroke: call to receiving-hospital door (Tier 1)"),
+  if (has_t2) natl_row(acc$t_door_strk2, w_cv, PAR$std$stroke,
                        "Stroke: call to reperfusion-capable door (Tier 2)")
-)
+) |>
+  mutate(denominator = ifelse(grepl("^(STEMI|Stroke)", condition),
+                              "Residents aged 40+", "All residents"),
+         denominator_n = ifelse(grepl("^(STEMI|Stroke)", condition), sum(w_cv), sum(w)))
 write_csv(natl, file.path(tabs, "table1_national.csv"))
 print(natl, width = Inf)
 
@@ -642,10 +694,11 @@ gov_tab <- acc |> st_drop_geometry() |>
     resp_le8_pct   = cov_pct(t_resp, cell_total, PAR$std$response),
     trauma_med     = wq(t_door_trauma, cell_total, .5),
     trauma_std_pct = cov_pct(t_door_trauma, cell_total, PAR$std$trauma),
-    stemi_med      = wq(t_fmc_device, cell_total, .5),
-    stemi_std_pct  = cov_pct(t_fmc_device, cell_total, PAR$std$stemi_fmc),
-    stroke_med     = wq(t_door_strk1, cell_total, .5),
-    stroke_std_pct = cov_pct(t_door_strk1, cell_total, PAR$std$stroke),
+    stemi_med      = wq(t_fmc_device, cell_cv, .5),
+    stemi_std_pct  = cov_pct(t_fmc_device, cell_cv, PAR$std$stemi_fmc),
+    stroke_med     = wq(t_door_strk1, cell_cv, .5),
+    stroke_std_pct = cov_pct(t_door_strk1, cell_cv, PAR$std$stroke),
+    pop_40plus     = sum(cell_cv),
     .groups = "drop") |>
   arrange(region_en, desc(pop))
 write_csv(gov_tab, file.path(tabs, "table2_governorate.csv"))
@@ -656,8 +709,9 @@ reg_tab <- acc |> st_drop_geometry() |>
     pop            = sum(cell_total),
     resp_le8_pct   = cov_pct(t_resp, cell_total, PAR$std$response),
     trauma_std_pct = cov_pct(t_door_trauma, cell_total, PAR$std$trauma),
-    stemi_std_pct  = cov_pct(t_fmc_device, cell_total, PAR$std$stemi_fmc),
-    stroke_std_pct = cov_pct(t_door_strk1, cell_total, PAR$std$stroke),
+    stemi_std_pct  = cov_pct(t_fmc_device, cell_cv, PAR$std$stemi_fmc),
+    stroke_std_pct = cov_pct(t_door_strk1, cell_cv, PAR$std$stroke),
+    pop_40plus     = sum(cell_cv),
     .groups = "drop") |> arrange(desc(pop))
 
 # SRCA CAD regional aggregates (Annual Report 2025 Tables 22/2, 23/2, 28/2;
@@ -679,14 +733,16 @@ reg_tab <- reg_tab |>
 # Demand-weighted national coverage: reweight regional shares by observed 2025
 # mission volume instead of residential population. Population weighting over
 # a partition reproduces the cell-level national shares exactly, so the
-# population-weighted row doubles as an internal-consistency check.
+# population-weighted row doubles as an internal-consistency check (STEMI and
+# stroke regional shares are weighted by residents aged 40+).
 wt_row <- function(wcol, label) {
-  w <- reg_tab[[wcol]]   # capture before summarise() masks the columns
+  w  <- reg_tab[[wcol]]   # capture before summarise() masks the columns
+  wc <- if (wcol == "pop") reg_tab$pop_40plus else w
   reg_tab |>
     summarise(region_en = label,
-              across(c(resp_le8_pct, trauma_std_pct, stemi_std_pct,
-                       stroke_std_pct), ~ weighted.mean(.x, w)),
-              pop = sum(pop),
+              across(c(resp_le8_pct, trauma_std_pct), ~ weighted.mean(.x, w)),
+              across(c(stemi_std_pct, stroke_std_pct), ~ weighted.mean(.x, wc)),
+              pop = sum(pop), pop_40plus = sum(pop_40plus),
               missions_2025 = sum(missions_2025),
               transports_2025 = sum(transports_2025),
               launch_points_2025 = sum(launch_points_2025),
@@ -717,8 +773,8 @@ ur_tab <- acc |> st_drop_geometry() |>
     resp_le8_pct   = cov_pct(t_resp, cell_total, PAR$std$response),
     trauma_med     = wq(t_door_trauma, cell_total, .5),
     trauma_std_pct = cov_pct(t_door_trauma, cell_total, PAR$std$trauma),
-    stemi_std_pct  = cov_pct(t_fmc_device, cell_total, PAR$std$stemi_fmc),
-    stroke_std_pct = cov_pct(t_door_strk1, cell_total, PAR$std$stroke),
+    stemi_std_pct  = cov_pct(t_fmc_device, cell_cv, PAR$std$stemi_fmc),
+    stroke_std_pct = cov_pct(t_door_strk1, cell_cv, PAR$std$stroke),
     .groups = "drop") |>
   mutate(pop_pct = pop / sum(pop) * 100, .after = pop)
 write_csv(ur_tab, file.path(tabs, "tableS_urban_rural.csv"))
@@ -745,7 +801,7 @@ delta_op <- uniroot(
   c(0, 30))$root
 acc <- acc |> mutate(t_resp_op = t_resp + delta_op)
 message(sprintf(
-  "Operational delay reconciling modelled with observed KPI: %.2f min",
+  "Residual per-call delay (delta) reconciling modeled with observed KPI: %.2f min",
   delta_op))
 
 # The last two rows are the operational lever: the 8-minute share if the
@@ -775,6 +831,7 @@ write_csv(kpi, file.path(tabs, "tableS_kpi_decomposition.csv"))
 print(kpi)
 
 resp_mean_base <- weighted.mean(acc$t_resp, w, na.rm = TRUE)
+resp_mean_cv   <- weighted.mean(acc$t_resp, w_cv, na.rm = TRUE)   # STEMI/stroke pathways
 validation <- tibble(
   moment   = c("Mean travel to scene (min)",
                "Responses within 8 min (%)",
@@ -800,10 +857,10 @@ validation <- tibble(
   modelled = c(weighted.mean(alpha * acc$t_legA, w, na.rm = TRUE),
                cov_pct(acc$t_resp, w, PAR$std$response),
                resp_mean_base + delta_op,
-               resp_mean_base + delta_op,
-               resp_mean_base + delta_op,
-               wq(acc$t_door_cath, w, .5) + delta_op,
-               wq(PAR$scene_min + alpha * acc$t_cath, w, .5)))
+               resp_mean_cv + delta_op,
+               resp_mean_cv + delta_op,
+               wq(acc$t_door_cath, w_cv, .5) + delta_op,
+               wq(PAR$scene_min + alpha * acc$t_cath, w_cv, .5)))
 write_csv(validation, file.path(tabs, "validation_moments.csv"))
 print(validation)
 
@@ -850,18 +907,18 @@ acc <- acc |>
 bypass <- tibble(
   condition = c("STEMI (cath centre)", "Stroke Tier 1",
                 if (has_t2) "Stroke Tier 2 (reperfusion-capable)"),
-  median_extra_min = c(wq(acc$bypass_cath, w, .5),
-                       wq(acc$bypass_strk1, w, .5),
-                       if (has_t2) wq(acc$bypass_strk2, w, .5)),
-  p90_extra_min    = c(wq(acc$bypass_cath, w, .9),
-                       wq(acc$bypass_strk1, w, .9),
-                       if (has_t2) wq(acc$bypass_strk2, w, .9)),
-  extra_le15_pct   = c(cov_pct(acc$bypass_cath, w, 15),
-                       cov_pct(acc$bypass_strk1, w, 15),
-                       if (has_t2) cov_pct(acc$bypass_strk2, w, 15)),
-  extra_le30_pct   = c(cov_pct(acc$bypass_cath, w, 30),
-                       cov_pct(acc$bypass_strk1, w, 30),
-                       if (has_t2) cov_pct(acc$bypass_strk2, w, 30)))
+  median_extra_min = c(wq(acc$bypass_cath, w_cv, .5),
+                       wq(acc$bypass_strk1, w_cv, .5),
+                       if (has_t2) wq(acc$bypass_strk2, w_cv, .5)),
+  p90_extra_min    = c(wq(acc$bypass_cath, w_cv, .9),
+                       wq(acc$bypass_strk1, w_cv, .9),
+                       if (has_t2) wq(acc$bypass_strk2, w_cv, .9)),
+  extra_le15_pct   = c(cov_pct(acc$bypass_cath, w_cv, 15),
+                       cov_pct(acc$bypass_strk1, w_cv, 15),
+                       if (has_t2) cov_pct(acc$bypass_strk2, w_cv, 15)),
+  extra_le30_pct   = c(cov_pct(acc$bypass_cath, w_cv, 30),
+                       cov_pct(acc$bypass_strk1, w_cv, 30),
+                       if (has_t2) cov_pct(acc$bypass_strk2, w_cv, 30)))
 write_csv(bypass, file.path(tabs, "tableS_bypass.csv"))
 
 # ---- 9. Inequality: weighted Gini and Theil decomposition ----------------
@@ -899,7 +956,8 @@ drive <- list(
   "Trauma door"    = alpha * (acc$t_legA + acc$t_trauma),
   "STEMI FMC-to-device" = alpha * acc$t_cath,
   "Stroke door T1" = alpha * (acc$t_legA + acc$t_strk1))
-eq_tab <- bind_rows(lapply(drive, function(x) {
+drive_w <- list(w, w, w_cv, w_cv)   # STEMI and stroke: residents aged 40+
+eq_tab <- bind_rows(Map(function(x, w) {
   td <- theil_nested(x, w, acc$region_en, acc$Gov_EN)
   tibble(gini = gini_w(x, w), theil_total = td$total,
          between_region_pct = td$between_region / td$total * 100,
@@ -907,7 +965,7 @@ eq_tab <- bind_rows(lapply(drive, function(x) {
          within_gov_pct = td$within_gov / td$total * 100,
          between_gov_pct = (td$between_region + td$between_gov_within_region) /
            td$total * 100)
-}), .id = "metric")
+}, drive, drive_w), .id = "metric")
 write_csv(eq_tab, file.path(tabs, "tableS_inequality.csv"))
 print(eq_tab, width = Inf)
 
@@ -967,7 +1025,7 @@ message(sprintf("LISA Low-Low (deficit belt) governorate-metric pairs: %d",
 # (OSM speed tags; see PAR$track_speed). A copy caps track edges at
 # PAR$track_sens; topology is unchanged, so snapping and the routable core
 # carry over. Response, trauma, cath and stroke legs are rerouted and alpha
-# is refitted to the same travel-to-scene moment.
+# is refitted to the same travel-to-scene indicator.
 v_edge <- graph$d / graph$time * 3.6
 cls <- c("motorway", "trunk", "primary", "secondary", "tertiary",
          "unclassified", "residential", "track")
@@ -996,21 +1054,24 @@ rm(g_tr); invisible(gc())
 alpha_tr <- PAR$obs$travel_scene_min / weighted.mean(tt_tr$legA$minutes, w, na.rm = TRUE)
 message(sprintf("Track sensitivity: alpha refitted = %.3f", alpha_tr))
 
+# wgt weights response and trauma; wgt_cv weights STEMI and stroke (default:
+# residents aged 40+).
 sens_row <- function(scenario, scene, a, wgt, t_tr, t_ca, t_s1,
                      extra = 0, b = a, dd = PAR$door_device_min,
-                     t_lA = acc$t_legA) {
+                     t_lA = acc$t_legA, wgt_cv = w_cv) {
   resp <- FIXED_PRE + extra + a * t_lA
   fmc  <- scene + b * t_ca + dd
   tibble(scenario = scenario,
          trauma_std_pct = cov_pct(resp + scene + b * t_tr, wgt, PAR$std$trauma),
-         stemi_std_pct  = cov_pct(fmc, wgt, PAR$std$stemi_fmc),
-         stemi_120_pct  = cov_pct(fmc, wgt, PAR$std$stemi_fmc_strategy),
-         stroke_std_pct = cov_pct(resp + scene + b * t_s1, wgt, PAR$std$stroke),
+         stemi_std_pct  = cov_pct(fmc, wgt_cv, PAR$std$stemi_fmc),
+         stemi_120_pct  = cov_pct(fmc, wgt_cv, PAR$std$stemi_fmc_strategy),
+         stroke_std_pct = cov_pct(resp + scene + b * t_s1, wgt_cv, PAR$std$stroke),
          resp_le8_pct   = cov_pct(resp, wgt, PAR$std$response))
 }
 
+
 sens <- bind_rows(
-  sens_row("Base (scene 15, alpha, total pop)", PAR$scene_min, alpha, w,
+  sens_row("Base (scene 15, alpha, primary denominators)", PAR$scene_min, alpha, w,
            acc$t_trauma, acc$t_cath, acc$t_strk1),
   sens_row("On-scene 10 min", PAR$scene_sens[1], alpha, w,
            acc$t_trauma, acc$t_cath, acc$t_strk1),
@@ -1021,7 +1082,13 @@ sens <- bind_rows(
   sens_row("Speed -10% (alpha x 1.1)", PAR$scene_min, alpha * PAR$alpha_sens[2],
            w, acc$t_trauma, acc$t_cath, acc$t_strk1),
   sens_row("Saudi-only denominator", PAR$scene_min, alpha, acc$cell_saudi,
-           acc$t_trauma, acc$t_cath, acc$t_strk1),
+           acc$t_trauma, acc$t_cath, acc$t_strk1, wgt_cv = acc$cell_cv_saudi),
+  sens_row("STEMI and stroke: all ages", PAR$scene_min, alpha, w,
+           acc$t_trauma, acc$t_cath, acc$t_strk1, wgt_cv = w),
+  sens_row("STEMI and stroke: residents aged 50+", PAR$scene_min, alpha, w,
+           acc$t_trauma, acc$t_cath, acc$t_strk1, wgt_cv = acc$cell_50),
+  sens_row("STEMI and stroke: residents aged 65+", PAR$scene_min, alpha, w,
+           acc$t_trauma, acc$t_cath, acc$t_strk1, wgt_cv = acc$cell_65),
   sens_row(sprintf("Residual-delay scenario (+%.1f min, KPI-matched)",
                    delta_op), PAR$scene_min, alpha, w,
            acc$t_trauma, acc$t_cath, acc$t_strk1, extra = delta_op),
@@ -1066,20 +1133,25 @@ gov_bg  <- st_geometry(gov)
 crs_disp <- 32638                                     # UTM 38N
 gov_disp <- st_transform(gov_bg, crs_disp)
 xy_disp  <- st_coordinates(st_transform(acc, crs_disp))
+cv_share <- sum(acc$cell_cv) / sum(acc$cell_total)    # residents aged 40+ (26%)
 blk <- acc |>
   st_drop_geometry() |>
   mutate(bx = floor(xy_disp[, 1] / 1e4), by = floor(xy_disp[, 2] / 1e4)) |>
   group_by(bx, by) |>
   summarise(
     t_door_trauma = weighted.mean(t_door_trauma, cell_total, na.rm = TRUE),
-    t_fmc_device  = weighted.mean(t_fmc_device,  cell_total, na.rm = TRUE),
-    t_door_strk1  = weighted.mean(t_door_strk1,  cell_total, na.rm = TRUE),
+    # STEMI and stroke panels: residents aged 40+ (2026-11-14)
+    t_fmc_device  = weighted.mean(t_fmc_device,  cell_cv,    na.rm = TRUE),
+    t_door_strk1  = weighted.mean(t_door_strk1,  cell_cv,    na.rm = TRUE),
     pop           = sum(cell_total),
+    pop_cv        = sum(cell_cv),
     .groups = "drop") |>
   mutate(x = bx * 1e4 + 5e3, y = by * 1e4 + 5e3,
          # opacity by block population (log scale): sparsely populated desert
          # blocks recede so the map reads like the population-weighted shares
-         pop_alpha = c(0.18, 0.55, 1)[findInterval(pop, c(1e3, 1e4)) + 1])
+         pop_alpha = c(0.18, 0.55, 1)[findInterval(pop, c(1e3, 1e4)) + 1],
+         # STEMI/stroke panels fade by residents aged 40+, steps scaled to their share
+         pop_alpha_cv = c(0.18, 0.55, 1)[findInterval(pop_cv, c(1e3, 1e4) * cv_share) + 1])
 
 cities <- tibble::tribble(
   ~name,     ~lon,  ~lat,  ~hj,  ~vj,
@@ -1095,14 +1167,14 @@ cities <- tibble::tribble(
 cities <- cities |>
   mutate(x = st_coordinates(cities)[, 1], y = st_coordinates(cities)[, 2])
 
-panel_map <- function(tcol, fac_layer, title) {
+panel_map <- function(tcol, fac_layer, title, acol = "pop_alpha") {
   d <- blk |> mutate(bin = time_bins(.data[[tcol]])) |> filter(!is.na(bin))
   ggplot() +
     geom_sf(data = gov_disp, fill = "grey92", color = "grey78",
             linewidth = 0.12) +
     # show.legend = TRUE keeps keys for unused bins (panel B has no cell
     # <= 30 min), so the three panel legends stay identical and collect
-    geom_tile(data = d, aes(x, y, fill = bin, alpha = pop_alpha),
+    geom_tile(data = d, aes(x, y, fill = bin, alpha = .data[[acol]]),
               width = 1e4, height = 1e4, show.legend = TRUE) +
     scale_alpha_identity() +
     geom_sf(data = st_transform(fac_layer, crs_disp), shape = 3, size = 0.7,
@@ -1118,17 +1190,19 @@ panel_map <- function(tcol, fac_layer, title) {
 fig1 <- panel_map("t_door_trauma", trauma_sf,
                   sprintf("A  Trauma, call to door\n(n=%d cluster hospitals with an ER)", nrow(trauma_sf))) +
         panel_map("t_fmc_device", cath_sf,
-                  sprintf("B  STEMI, first medical contact to device\n(n=%d catheterization centers)", nrow(cath_sf))) +
+                  sprintf("B  STEMI, first medical contact to device\n(n=%d catheterization centers)", nrow(cath_sf)),
+                  acol = "pop_alpha_cv") +
         panel_map("t_door_strk1", stroke_sf,
-                  sprintf("C  Stroke, call to door\n(n=%d receiving hospitals)", nrow(stroke_sf))) +
+                  sprintf("C  Stroke, call to door\n(n=%d receiving hospitals)", nrow(stroke_sf)),
+                  acol = "pop_alpha_cv") +
         patchwork::plot_layout(ncol = 3, guides = "collect") &
         theme(legend.position = "bottom")
 ggsave(file.path(figs, "fig1_maps_call_to_door.png"), fig1,
        width = 13, height = 5.6, dpi = 300, bg = "white")
 
 # Fig 2 -- calibration/validation + KPI decomposition. Panel A: one facet
-# per moment (own y scale, so minutes and percent never share an axis).
-# Panel A omits the fitted moment (travel to scene, equal by construction).
+# per indicator (own y scale, so minutes and percent never share an axis).
+# Panel A omits the fitted indicator (travel to scene, equal by construction).
 lab_lv <- c("SRCA", "Base model", "Model + \u03b4", "Median from call + \u03b4",
             "Median from contact")
 f2a <- validation |>
@@ -1147,7 +1221,7 @@ f2a <- validation |>
                                "Median from call + \u03b4" = "#7FA7CF",
                                "Median from contact" = "#B8CFE6")) +
   scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
-  labs(title = "A  Model against SRCA 2025 moments", x = NULL, y = NULL) +
+  labs(title = "A  Model against SRCA 2025 performance indicators", x = NULL, y = NULL) +
   theme_minimal(base_size = 9) +
   theme(strip.text = element_text(size = 6.5),
         axis.text.x = element_text(size = 6.5, angle = 30, hjust = 1))
@@ -1159,11 +1233,11 @@ resp_grid <- tibble(t = seq(0, 30, 0.25)) |>
          oper   = cov_pct(acc$t_resp_op, w, t)) |>
   ungroup()
 lt <- c("Travel only (structural ceiling)"   = 2,
-        "With queue + mobilization"          = 1,
+        "With call handling + mobilization"  = 1,
         "With residual delay (KPI-matched)" = 3)
 f2b <- ggplot(resp_grid, aes(t)) +
   geom_line(aes(y = travel, linetype = "Travel only (structural ceiling)")) +
-  geom_line(aes(y = model,  linetype = "With queue + mobilization")) +
+  geom_line(aes(y = model,  linetype = "With call handling + mobilization")) +
   geom_line(aes(y = oper,
                 linetype = "With residual delay (KPI-matched)")) +
   geom_vline(xintercept = 8, color = "red3", linewidth = 0.3) +
@@ -1274,7 +1348,7 @@ ggsave(file.path(figs, "figS_facility_maps.png"), figS2,
 
 # Cell-level export for the supplement / reproducibility deposit
 acc |> st_drop_geometry() |>
-  select(cell_id, Gov_EN, region_en, cell_total, cell_saudi, dens_class,
+  select(cell_id, Gov_EN, region_en, cell_total, cell_saudi, cell_cv, dens_class,
          t_legA, t_resp, t_resp_op, starts_with("t_door"), t_fmc_device,
          starts_with("bypass")) |>
   write_csv(file.path(prc, "cell_level_results.csv"))
@@ -1292,7 +1366,7 @@ acc |> st_drop_geometry() |>
 #       cluster_en carried through from the provider list). Each round picks
 #       the hospital whose upgrade newly covers the most residents within
 #       the STEMI first-medical-contact-to-device window (90 min; ACC/AHA;
-#       30-min door-to-device assumed) or the 60-min stroke call-to-door
+#       35-min door-to-device assumed) or the 60-min stroke call-to-door
 #       window (base case).
 #       STEMI candidates: the >=100-bed general/tertiary subset (cath-lab
 #       feasibility), minus hospitals already on the SRCA cath list
@@ -1301,10 +1375,11 @@ acc |> st_drop_geometry() |>
 # Routing for (b) is direction-true (cell -> hospital): the street graph is
 # reversed by renaming its from_/to_ columns, so one Dijkstra per CANDIDATE
 # (n=250) replaces one per cell (n=67,075). Cached sparse at <= 80 raw
-# minutes; the widest per-cell budget is STEMI's (90 - 15 - 30)/(0.9 alpha) = 53.
+# minutes; the widest per-cell budget is stroke's (60 - 15 - 1.25)/(0.9 alpha)
+# = 52 (STEMI: (90 - 15 - 35)/(0.9 alpha) = 47), both under the 80-minute cap.
 
 # (a) reach vs delivery legs
-leg_row <- function(x, label) tibble(
+leg_row <- function(x, label, w = acc$cell_total) tibble(   # STEMI/stroke legs: w_cv
   leg          = label,
   median_min   = wq(x, w, .5),
   mean_min     = weighted.mean(x, w, na.rm = TRUE),
@@ -1316,8 +1391,8 @@ legs_tab <- bind_rows(
   leg_row(alpha * acc$t_legA,   "Drive to scene (calibrated, excl. pre-departure)"),
   leg_row(acc$t_resp,           "Reach: call to scene (1.25 min pre-departure + drive)"),
   leg_row(alpha * acc$t_trauma, "Deliver: scene to trauma door (transport only)"),
-  leg_row(alpha * acc$t_cath,   "Deliver: scene to cath-centre door (transport only)"),
-  leg_row(alpha * acc$t_strk1,  "Deliver: scene to stroke Tier-1 door (transport only)"))
+  leg_row(alpha * acc$t_cath,   "Deliver: scene to cath-centre door (transport only)", w_cv),
+  leg_row(alpha * acc$t_strk1,  "Deliver: scene to stroke Tier-1 door (transport only)", w_cv))
 write_csv(legs_tab, file.path(tabs, "tableS_transport_legs.csv"))
 print(legs_tab)
 
@@ -1385,8 +1460,9 @@ km_stroke <- km_to_nearest(stroke_sf)
 # fixed = the outcome's minutes outside the transport leg: on scene + assumed
 # door-to-device for STEMI first-medical-contact-to-device; response + on
 # scene for stroke and trauma call-to-door.
+# Gains are counted in residents aged 40+ (w = w_cv).
 greedy_upgrade <- function(idx, door_base, window, km_existing, fixed,
-                           top_n = 15, min_gain = 10000) {
+                           top_n = 15, min_gain = 10000, w = w_cv) {
   budget  <- (window - fixed) / alpha                       # raw-minute budget
   budget  <- rep_len(budget, nrow(acc))
   covered <- !is.na(door_base) & door_base <= window
@@ -1434,6 +1510,33 @@ up_stemi  <- greedy_upgrade(idx_stemi,  acc$t_fmc_device, PAR$std$stemi_fmc, km_
                             fixed = fixed_stemi)
 up_stroke <- greedy_upgrade(idx_stroke, acc$t_door_strk1, PAR$std$stroke,    km_stroke,
                             fixed = acc$t_resp + PAR$scene_min)
+# Expected SRCA pathway volume at each upgraded site (reviewer request,
+# 2026-11-15). Catchment: residents aged 40+ in cells whose nearest receiving
+# hospital, after all 15 upgrades, is that site (scene-to-hospital driving
+# time, raw minutes; existing network = t_cath / t_strk1). Expected cases =
+# catchment x the national SRCA 2025 pathway rate per resident aged 40+
+# (patients delivered to the current receiving lists, Tables 36/2 and 38/2).
+# Existing receiving hospitals' own 2025 counts give the comparison.
+site_catchment <- function(up, t_exist, fac) {
+  k  <- match(up$facility_id[-1], cand_id)
+  el <- cand_tt[cand_tt$cand %in% k, ]
+  el <- el[order(el$cell, el$t_raw), ]
+  el <- el[!duplicated(el$cell), ]
+  el <- el[is.na(t_exist[el$cell]) | el$t_raw < t_exist[el$cell], ]
+  pop  <- tapply(w_cv[el$cell], factor(el$cand, levels = k), sum)
+  pop[is.na(pop)] <- 0
+  rate <- sum(fac$srca_patients_2025, na.rm = TRUE) / sum(w_cv)
+  up |> mutate(catchment_40plus     = c(NA, unname(pop)),
+               expected_srca_cases = c(NA, unname(pop) * rate))
+}
+up_stemi  <- site_catchment(up_stemi,  acc$t_cath,  cath)
+up_stroke <- site_catchment(up_stroke, acc$t_strk1, stroke)
+message(sprintf(paste0("Upgrade-site expected SRCA cases/yr: STEMI %.0f-%.0f (existing centers median %.0f), ",
+  "stroke %.0f-%.0f (median %.0f)"),
+  min(up_stemi$expected_srca_cases, na.rm = TRUE), max(up_stemi$expected_srca_cases, na.rm = TRUE),
+  median(cath$srca_patients_2025, na.rm = TRUE),
+  min(up_stroke$expected_srca_cases, na.rm = TRUE), max(up_stroke$expected_srca_cases, na.rm = TRUE),
+  median(stroke$srca_patients_2025, na.rm = TRUE)))
 write_csv(up_stemi,  file.path(tabs, "tableS_upgrade_sites_stemi.csv"))
 write_csv(up_stroke, file.path(tabs, "tableS_upgrade_sites_stroke.csv"))
 print(up_stemi,  n = 20, width = Inf)
@@ -1444,7 +1547,7 @@ print(up_stroke, n = 20, width = Inf)
 # both rescale; the candidate time table is in raw minutes and unchanged.
 # Reports how much of each shortlist, and of its order, survives.
 greedy_picks <- function(idx, door, window, a, fixed, top_n = 15,
-                         min_gain = 10000) {
+                         min_gain = 10000, w = w_cv) {
   budget  <- rep_len((window - fixed) / a, nrow(acc))
   covered <- !is.na(door) & door <= window
   start   <- sum(w[covered]) / sum(w) * 100
@@ -1595,7 +1698,96 @@ message(sprintf(paste0("New stations (8-min, operational scenario): 15 sites +%.
   gain_d1,
   if (any(sites$matches_delta_1min)) which(sites$matches_delta_1min)[1] else ">150"))
 
+# ---- 13. Reviewer additions (2026-11-15) ---------------------------------
+# (a) Probabilistic sensitivity analysis. Each of 2,000 draws scales every
+# driving time by alpha x U(0.9, 1.1) (the +/-10% speed range of Section 10),
+# allows U(10, 20) minutes on scene (the 10- and 20-minute rows), and, for
+# STEMI, U(35, 63) minutes door-to-device (published direct-to-laboratory
+# time to the Saudi median). Shares use the Section 6 denominators and
+# windows; the interval is the 2.5th-97.5th percentile of the draws and
+# reflects input uncertainty, not sampling error.
+set.seed(20261115)
+n_psa <- 2000
+psa_par <- tibble(alpha_mult  = runif(n_psa, 0.9, 1.1),
+                  scene       = runif(n_psa, 10, 20),
+                  door_device = runif(n_psa, 35, 63))
+psa_shares <- function(am, sc, dd) {
+  a <- alpha * am
+  resp <- FIXED_PRE + a * acc$t_legA
+  c(response = cov_pct(resp, w, PAR$std$response),
+    trauma   = cov_pct(resp + sc + a * acc$t_trauma, w, PAR$std$trauma),
+    stemi    = cov_pct(sc + a * acc$t_cath + dd, w_cv, PAR$std$stemi_fmc),
+    stroke   = cov_pct(resp + sc + a * acc$t_strk1, w_cv, PAR$std$stroke))
+}
+psa_base <- psa_shares(1, PAR$scene_min, PAR$door_device_min)
+stopifnot(abs(psa_base[["stemi"]]  - cov_pct(acc$t_fmc_device, w_cv, PAR$std$stemi_fmc)) < 1e-9,
+          abs(psa_base[["stroke"]] - cov_pct(acc$t_door_strk1, w_cv, PAR$std$stroke)) < 1e-9,
+          abs(psa_base[["trauma"]] - cov_pct(acc$t_door_trauma, w, PAR$std$trauma)) < 1e-9)
+psa_draws <- t(mapply(psa_shares, psa_par$alpha_mult, psa_par$scene, psa_par$door_device))
+psa_tab <- tibble(
+  outcome   = c("Response within 8 min", "Trauma within 60 min (call to door)",
+                "STEMI within 90 min (first medical contact to device)",
+                "Stroke within 60 min (call to door)"),
+  denominator = c("All residents", "All residents", "Residents aged 40+", "Residents aged 40+"),
+  base_pct  = unname(psa_base),
+  psa_median_pct = apply(psa_draws, 2, median),
+  psa_lo_pct = apply(psa_draws, 2, quantile, 0.025),
+  psa_hi_pct = apply(psa_draws, 2, quantile, 0.975),
+  draws_below_base_pct = colMeans(sweep(psa_draws, 2, psa_base, "<")) * 100,
+  n_draws = n_psa)
+write_csv(psa_tab, file.path(tabs, "tableS_psa.csv"))
+print(psa_tab, width = Inf)
+
+# (b) Rural-favoring station siting: the same greedy method as Section 12,
+# but each round adds the cell that newly brings the most RURAL residents
+# (cells < 300 per km2) within 8 minutes in the residual scenario. Compared
+# with the population-maximizing sites at the same count (42, the delta
+# -1 min match).
+rural <- acc$dens_class == "Rural (<300 per km2)"
+greedy_sites_rural <- function(top_n = 150) {
+  covered <- covered_op
+  el <- site_cov[!covered[site_cov$cell], ]
+  cum <- sum(w[covered]) / sum(w) * 100
+  cum_r <- sum(w[covered & rural]) / sum(w[rural]) * 100
+  rows <- list()
+  for (r in seq_len(top_n)) {
+    el <- el[!covered[el$cell], , drop = FALSE]
+    if (!nrow(el)) break
+    gain_r <- tapply(w[el$cell] * rural[el$cell], el$site, sum)
+    if (max(gain_r) <= 0) break
+    best <- as.integer(names(gain_r)[which.max(gain_r)])
+    newly <- unique(el$cell[el$site == best])
+    covered[newly] <- TRUE
+    g_all <- sum(w[newly])
+    cum   <- cum + g_all / sum(w) * 100
+    cum_r <- cum_r + max(gain_r) / sum(w[rural]) * 100
+    rows[[r]] <- tibble(rank = r, cell_id = grid$cell_id[best],
+                        governorate = acc$Gov_EN[best], region = acc$region_en[best],
+                        dens_class = as.character(acc$dens_class[best]),
+                        newly_covered_rural = max(gain_r), newly_covered_pop = g_all,
+                        cum_rural_within_8_pct = cum_r, cum_within_8_pct = cum)
+  }
+  bind_rows(rows) |> mutate(cum_gain_m = cumsum(newly_covered_pop) / 1e6,
+                            cum_rural_gain_k = cumsum(newly_covered_rural) / 1e3)
+}
+sites_rural <- greedy_sites_rural()
+n_match <- which(sites$matches_delta_1min)[1]
+pm_cells <- unique(site_cov$cell[site_cov$site %in% match(sites$cell_id[seq_len(n_match)], grid$cell_id)])
+pm_cells <- pm_cells[!covered_op[pm_cells]]
+rural_cmp <- tibble(
+  siting = c("Population-maximizing", "Rural-favoring"), n_sites = n_match,
+  rural_residents_gained = c(sum(w[pm_cells][rural[pm_cells]]),
+                             sites_rural$cum_rural_gain_k[n_match] * 1e3),
+  all_residents_gained = c(sum(w[pm_cells]), sites_rural$cum_gain_m[n_match] * 1e6),
+  rural_within_8_pct_after = c(sum(w[(covered_op | seq_along(w) %in% pm_cells) & rural]) / sum(w[rural]) * 100,
+                               sites_rural$cum_rural_within_8_pct[n_match]),
+  rural_within_8_pct_before = sum(w[covered_op & rural]) / sum(w[rural]) * 100)
+stopifnot(abs(rural_cmp$all_residents_gained[1] / 1e6 - sites$cum_gain_m[n_match]) < 1e-9)
+write_csv(sites_rural, file.path(tabs, "tableS_station_sites_rural.csv"))
+write_csv(rural_cmp,   file.path(tabs, "tableS_station_siting_compare.csv"))
+print(rural_cmp, width = Inf)
+
 message("Done. Tables -> output/tables | Figures -> output/figures | ",
         sprintf("alpha = %.3f | trauma set '%s' (n=%d)%s",
                 alpha, PAR$trauma_set, nrow(trauma_sf),
-                if (has_t2) "" else " | stroke Tier 2 pending clinician list"))
+                if (has_t2) " | stroke Tier 2 included" else ""))
